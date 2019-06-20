@@ -1,6 +1,9 @@
 ﻿using Newtonsoft.Json;
+using NHttp;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -33,6 +36,26 @@ namespace TaskServerMonitor
         public bool ClarityTrayIsRunning { get; set; }
         public int FreeRAM { get; set; }
         public long SystemDriveFree { get; set; }
+        public string ActiveTask { get; set; }
+        public int ActiveTaskRuntime { get; set; }
+        public string ServerState { get; set; }
+    }
+
+    /// <summary>
+    /// This is the Status of ALL Accelerators
+    /// </summary>
+    public class Accelerators
+    {
+        public Dictionary<string, AcceleratorStatus> Accelerator { get; set; }
+    }
+
+    /// <summary>
+    /// This is the name and status of ONE accelerator.  The bool array will have contain the status for the various Revit Server versions
+    /// </summary>
+    public class AcceleratorStatus
+    {
+        public string Name { get; set; }
+        public Dictionary<string, bool> Status { get; set; }
     }
 
     class TSMon_Service
@@ -43,8 +66,12 @@ namespace TaskServerMonitor
         //object to hold server current satus
         private static ServerStatus CurrentStatus = new ServerStatus();
 
+        //object to hold the status of the accelerators
+        private static Accelerators AcceleratorStatuses = new Accelerators();
+
         //this is used to lock the object for writing then needed
         private static object updateServerData = new object();
+
 
         //any internal variables needed for configuration
         internal static string default_server = ""; //this is the IP of the ???????? 
@@ -52,19 +79,21 @@ namespace TaskServerMonitor
         internal static string log_file = "TSMon.log";
         internal static int timeout = 5000; //in msec
         internal static int collection_interval = 60000; //60 seconds
+        internal static string taskserver_log = ""; //get this from the config file or ignore the update of this data
+        internal static bool taskserver_log_available = false;
+        internal static bool accelerator_check = false;
 
-
-        //the maximum number of characters we are willing to read form the client.
-        static readonly int maxMessageSize = 256;
-
-        //our listening socket
-        internal static Socket listener;
 
         //semafore event 
         public static ManualResetEvent allDone = new ManualResetEvent(false);
 
         public static void Start()
         {
+            lock (updateServerData)
+            {
+                CurrentStatus.ServerState = "starting";
+            }
+#region Read Configuration
             //get the path of the executable
             string servicePath = System.IO.Path.GetDirectoryName(Assembly.GetExecutingAssembly().CodeBase);
 
@@ -72,37 +101,196 @@ namespace TaskServerMonitor
 
             try
             {
-                //XElement serverConfig = XElement.Load(servicePath + "\\tsmon.config");
-                //default_server_port = serverConfig.Element("port").Value;
-                //timeout = int.Parse(serverConfig.Element("timeout_msec").Value);
-                //collection_interval = int.Parse(serverConfig.Element("collection_interval").Value);
-
-                //create and start the listener thread
-                Thread loop = new Thread(StartListenning);
-                loop.Start();
-
-                //DESIGN: We don't need "real-time" data, as data collection is expensive lets collect data every <collection_interval> and provide it to 
-                //        whoever asks for it
-
-
-                //get the current status
-                OnTimerDataCollection(null, null);
-
-                //now start a timer that will collect data and return it to whom ever asks for status.
-                System.Timers.Timer tmrDataCollector = new System.Timers.Timer();
-                tmrDataCollector.Interval = collection_interval;
-                tmrDataCollector.Elapsed += new System.Timers.ElapsedEventHandler(OnTimerDataCollection);
-                tmrDataCollector.Start();
+                XElement serverConfig = XElement.Load(servicePath + "\\tsmon.config");
+                default_server_port = serverConfig.Element("port").Value;
+                timeout = int.Parse(serverConfig.Element("timeout_msec").Value);
+                collection_interval = int.Parse(serverConfig.Element("refresh").Value);
+                try
+                {
+                    taskserver_log = serverConfig.Element("clarity_log").Value;
+                    taskserver_log_available = true;
+                }
+                catch (Exception)
+                {
+                    //never mind; task server log not available to monitor
+                }
 
 
+                //determine if i'm responsible for checking the accelerators
+                try
+                {
+                    accelerator_check = Boolean.Parse(serverConfig.Element("accelerator_check").Value);
+
+                    //if I am then read in the list of accelerators to check
+                    if (accelerator_check)
+                    {
+                        XElement accConfig = serverConfig.Element("accelerators");
+                        XElement accCommands = serverConfig.Element("accelerator_wsdl");
+                    }
+                }
+                catch (Exception)
+                { }
+
+                #endregion
+
+#region Setup Networking
+                //setup the network
+                IPHostEntry ipHostInfo;
+                IPAddress ipAddress;
+                IPEndPoint localEndPoint;
+
+                //start a lightweight HTTP server to handle requests
+                using (var httpd = new HttpServer())
+                {
+                    //first try with the IP address given (or name or whatever)
+                    int server_port = 0;
+                    //find the address and port to run the server at
+
+                    try
+                    {
+                        if (default_server == "")
+                        {
+                            throw new Exception();
+                        }
+
+                        ipHostInfo = Dns.GetHostEntry(default_server);
+                        ipAddress = Array.Find(ipHostInfo.AddressList, a => a.AddressFamily == AddressFamily.InterNetwork);
+                        if (!int.TryParse(default_server_port, out server_port))
+                        {
+                            log.Error("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
+                            throw new Exception("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
+                        }
+
+                        httpd.EndPoint = new IPEndPoint(ipAddress, server_port);
+                    }
+                    //if that fails try to figure it out on our own
+                    catch (Exception)
+                    {
+                        log.Info("Failed to use address provided " + default_server + ". Trying to find my own way...");
+                        ipHostInfo = Dns.GetHostEntry(Dns.GetHostName());
+                        ipAddress = Array.Find(ipHostInfo.AddressList, a => a.AddressFamily == AddressFamily.InterNetwork);
+                        if (!int.TryParse(default_server_port, out server_port))
+                        {
+                            log.Error("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
+                            throw new Exception("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
+                        }
+
+                        httpd.EndPoint = new IPEndPoint(IPAddress.Any, server_port);
+                    }
+                    #endregion
+
+#region Command Processors
+
+                    httpd.RequestReceived += (s, e) =>
+                    {
+                        string rq = e.Request.Path;
+                        e.Response.Headers.Add("Access-Control-Allow-Origin", "*");
+                        e.Response.Headers.Add("Access-Control-Allow-Methods", "POST, GET");
+                        switch (rq)
+                        {
+                            case "/status/":
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    
+                                    res.Write(JsonConvert.SerializeObject(CurrentStatus));
+                                }
+                                break;
+                            case "/statusupdate/":                                           //someone is impatient
+                                OnTimerDataCollection(null, null);
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write(JsonConvert.SerializeObject(CurrentStatus));
+                                }
+                                break;
+                            case "/cleanup/":
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write("Don't know how to cleanup yet.", rq);
+                                }
+                                break;
+                            case "/deepclean/":
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write("Don't know how to do deep clean yet.", rq);
+                                }
+                                break;
+                            case "/reboot/":
+
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write("Don't know how to reboot yet.", rq);
+                                }
+                                break;
+                            case "/pause/":
+                                PauseTaskServer();
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write(JsonConvert.SerializeObject(CurrentStatus));
+                                }
+                                break;
+                            case "/resume/":
+                                UnPauseTaskServer();
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write(JsonConvert.SerializeObject(CurrentStatus));
+                                }
+                                break;
+                            case "/accelerators/":
+                                CheckAccelerators();
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write(JsonConvert.SerializeObject(AcceleratorStatuses));
+                                }
+                                break;
+                            default:
+                                using (var res = new StreamWriter(e.Response.OutputStream))
+                                {
+                                    res.Write("I'm afraid I don't know what to do for \"{0}\"", rq);
+                                }
+                                break;
+                        }
+                    };
+
+                    httpd.Start();
+                    #endregion
+
+
+                    lock (updateServerData)
+                    {
+                        CurrentStatus.ServerState = "idle";
+                    }
+
+#if DEBUG
+                    //Process.Start(String.Format("http://{0}/", httpd.EndPoint));
+#endif
+
+                    //DESIGN: We don't need "real-time" data, as data collection is expensive lets collect data every <collection_interval> and provide it to 
+                    //        whoever asks for it
+
+                    //get the current status
+                    OnTimerDataCollection(null, null);
+
+                    //now start a timer that will collect data and return it to whom ever asks for status.
+                    System.Timers.Timer tmrDataCollector = new System.Timers.Timer();
+                    tmrDataCollector.Interval = collection_interval;
+                    tmrDataCollector.Elapsed += new System.Timers.ElapsedEventHandler(OnTimerDataCollection);
+                    tmrDataCollector.Start();
+
+#if DEBUG
+                    Console.WriteLine("Task Server Monitor running on port " + server_port + "\nPress any key to QUIT...");
+                    Console.ReadKey();
+#endif
+                }
 
             }
             catch (Exception m)
             {
-                Console.WriteLine(m.Message);
+                Debug.WriteLine(m.Message);
                 throw;
             }
         }
+
+
 
         public static void Stop()
         {
@@ -133,208 +321,149 @@ namespace TaskServerMonitor
             //is Revit Running
             Process[] psRevit = Process.GetProcessesByName("Revit");
             bool bRevitIsRunning = (psRevit.Count() > 0);
-
+            
             //is the Clarity Tray Process Running
             Process[] psClarityTray = Process.GetProcessesByName("ClarityTaskTray");
             bool bClarityTaskTray = (psClarityTray.Count() > 0);
 
+            //get available RAM
             var ramCounter = new PerformanceCounter("Memory", "Available MBytes");
             float iAvailableRAM = ramCounter.NextValue();
 
-            ulong FreeBytesAvailable;
-            ulong TotalNumberOfBytes;
-            ulong TotalNumberOfFreeBytes;
-
+            //and available disk space
             bool success = GetDiskFreeSpaceEx(@"C:\\",
-                                                out FreeBytesAvailable,
-                                                out TotalNumberOfBytes,
-                                                out TotalNumberOfFreeBytes);
+                                                out ulong FreeBytesAvailable,
+                                                out ulong TotalNumberOfBytes,
+                                                out ulong TotalNumberOfFreeBytes);
 
+            //see if we can tell what task is running
+            string currentTask = "unknown";
+            int taskRuntime = 0;
+
+            try
+            {
+                if (bRevitIsRunning && taskserver_log_available)
+                {
+                    string[] logFile;
+
+                    using (var fs = new FileStream(taskserver_log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var sr = new StreamReader(fs, Encoding.Default))
+                    {
+                        logFile = sr.ReadToEnd().Split(new string[] { Environment.NewLine }, StringSplitOptions.None);
+                    }
+
+                        foreach (string line in logFile)
+                        {
+                            if (line.Contains("Executing Task: Task:"))
+                            {
+                                currentTask = line.Substring(77, 6);
+                                DateTime taskStarted = Convert.ToDateTime(line.Substring(6, 19));
+                                taskRuntime = (int)DateTime.Now.Subtract(taskStarted).TotalMinutes;
+                            }
+                        }
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e.Message);
+                Debug.WriteLine("Can't read from file, are you sure its there?");
+            }
+
+
+            //check accelerators if its our job
+            if (accelerator_check)
+            {
+
+            }
+
+            //update the data object for future requests to feed to the clients
             lock (updateServerData)
             {
                 CurrentStatus.RevitIsRunning = bRevitIsRunning;
+
+                if (CurrentStatus.ServerState == "pausing" && !bRevitIsRunning)
+                {
+                    CurrentStatus.ServerState = "paused";
+                }
+                else
+                {
+                    if (bRevitIsRunning && CurrentStatus.ServerState != "pausing")
+                    {
+                        CurrentStatus.ServerState = "working";
+                    }
+                    else
+                    {
+                        if (!bRevitIsRunning)
+                        {
+                            CurrentStatus.ServerState = "idle";
+                        }
+                    }
+                }
+
                 CurrentStatus.ClarityTrayIsRunning = bClarityTaskTray;
+                if (!CurrentStatus.ClarityTrayIsRunning)
+                {
+                    CurrentStatus.ServerState = "nouser";
+                }
                 CurrentStatus.FreeRAM = (int)iAvailableRAM;
                 CurrentStatus.SystemDriveFree = (long)FreeBytesAvailable;
+                CurrentStatus.ActiveTask = currentTask;
+                CurrentStatus.ActiveTaskRuntime = taskRuntime;
             }
         }
+
 
         /// <summary>
-        /// This is the listening loop thread, it is responsible for setting up the socket and starting the listen loop
+        /// This will request to PAUSE the task server.  The request will be sent to the clarity host, NO TASKS WILL BE QUIT
         /// </summary>
-        private static void StartListenning()
+        public static void PauseTaskServer()
         {
-            int server_port = 0;
+            //request Clarity Host to Pause this server
+            //
+            //somehow
 
-            //create the async logger
-
-            //setup the network
-            IPHostEntry ipHostInfo;
-            IPAddress ipAddress;
-            IPEndPoint localEndPoint;
-
-
-            //first try with the IP address given (or name or whatever)
-            try
+            lock (updateServerData)
             {
-                if (default_server == "")
-                {
-                    throw new Exception();
-                }
-
-                ipHostInfo = Dns.GetHostEntry(default_server);
-                ipAddress = Array.Find(ipHostInfo.AddressList, a => a.AddressFamily == AddressFamily.InterNetwork);
-                if (!int.TryParse(default_server_port, out server_port))
-                {
-                    log.Error("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
-                    throw new Exception("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
-                }
-
-                localEndPoint = new IPEndPoint(ipAddress, server_port);
-            }
-            //if that fails try to figure it out on our own
-            catch (Exception)
-            {
-                log.Info("Failed to use address provided " + default_server + ". Trying to find my own way...");
-                ipHostInfo = Dns.GetHostEntry(Dns.GetHostName());
-                ipAddress = Array.Find(ipHostInfo.AddressList, a => a.AddressFamily == AddressFamily.InterNetwork);
-                if (!int.TryParse(default_server_port, out server_port))
-                {
-                    log.Error("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
-                    throw new Exception("Server port configuration is incorrect, make sure the port is specified in the server_config.xml file");
-                }
-
-                localEndPoint = new IPEndPoint(IPAddress.Any, server_port);
-            }
-            //IPHostEntry ipHostInfo = Dns.GetHostEntry(Dns.GetHostName());
-
-            //Create a TCP/IP socket
-
-            listener = new Socket(ipAddress.AddressFamily,
-                        SocketType.Stream, ProtocolType.Tcp);
-
-            Console.WriteLine("Waiting for connection on {0}:{1}...", localEndPoint.Address.ToString(), localEndPoint.Port);
-            log.Info("Starting Server on " + localEndPoint.Address.ToString() + ":" + localEndPoint.Port);
-            // bind and listen
-            try
-            {
-                listener.Bind(localEndPoint);
-                listener.ReceiveTimeout = timeout;
-                listener.Listen(50);
-
-                while (true)
-                {
-                    //reset signal
-                    allDone.Reset();
-
-                    //start an async socker and listen for connections
-
-                    listener.BeginAccept(new AsyncCallback(AcceptCallback), listener);
-                    allDone.WaitOne();
-                }
-            }
-            catch (Exception e)
-            {
-                log.Fatal(e.ToString());
-                Console.WriteLine(e.ToString());
-            }
-        }
-
-        public static void AcceptCallback(IAsyncResult ar)
-        {
-            //Singnal the main thread to resume/continue
-            allDone.Set();
-
-            Socket listener = (Socket)ar.AsyncState;
-            Socket handler = listener.EndAccept(ar);
-            Console.WriteLine("Got connection from {0}, resuming listening mode...", IPAddress.Parse(((IPEndPoint)handler.RemoteEndPoint).Address.ToString()));
-            log.Info(String.Format("Got Connection from {0}, going back to lisening mode...", IPAddress.Parse(((IPEndPoint)handler.RemoteEndPoint).Address.ToString())));
-
-            char[] charsToTrim = { '\n', '\r' };
-
-            //setup is done - start reading and work
-
-            //handler.Send(Encoding.ASCII.GetBytes("OK"));
-
-            //we will wait at most <timeout> seconds for the whole transaction from start to end
-            //anything that takes longer than <timeout> we are just gonna drop.
-            var killConnectionTimer = new Timer(KillConnection, handler, timeout, 0);
-
-            //Create state object
-            StateObject s = new StateObject();
-            s.workSocket = handler;
-
-            byte[] bytes = new Byte[1024];
-            String data = String.Empty;
-
-
-            //loop untill we wither run our of viable buffer space (ie only listen for a XX bytes) or we get a \n (0x0A)
-            try
-            {
-                while (data.Length < maxMessageSize)
-                {
-                    int bytesRec = handler.Receive(bytes, 0, maxMessageSize, SocketFlags.None);
-                    data += Encoding.ASCII.GetString(bytes, 0, bytesRec);
-                    if (data.IndexOf('\n') > -1)
-                    {
-                        break;
-                    }
-                }
-
-                //we got here because we either got the \n (0x0A)....
-                if (data.IndexOf('\n') > -1)
-                {   //so process the message
-
-                    string command = data.TrimEnd(charsToTrim);
-
-                    switch (command)
-                    {
-                        case "UPDATE":
-
-                            string statusJSON = JsonConvert.SerializeObject(CurrentStatus);
-                            handler.Send(Encoding.ASCII.GetBytes(statusJSON));
-                            //handler.Send(Encoding.ASCII.GetBytes("OK"));
-                            break;
-                        default:
-                            break;
-                    }
-
-                    handler.Close();
-                    killConnectionTimer.Dispose();
-                    //handler.Send(Encoding.ASCII.GetBytes(GetLicense(data.Replace("<EOR>", ""))));
-
-                }
-                else //or are just reading garbage so we will ignore it;
-                {
-                    log.Warn("Got too much junk data, is someone trying to DOS us?");
-                    Console.WriteLine("Got garbage dumping client.");
-                    handler.Close();
-                }
-            }
-            catch (Exception e)
-            {
-                log.Error(e.Message);
-                //I don't think we care as to what happens here
+                CurrentStatus.ServerState = "pausing";
             }
         }
 
 
-        internal static void KillConnection(Object o)
+        private static void UnPauseTaskServer()
         {
-            Socket h = (Socket)o;
-            try
+            //request Clarity Host to RESUME this server
+            //
+            //somehow
+
+            OnTimerDataCollection(null, null);
+        }
+
+
+        /// <summary>
+        /// This function checks through all the accelerators and gets their statuses
+        /// </summary>
+        private static void CheckAccelerators()
+        {
+            foreach (string acceleratorName in AcceleratorStatuses.Accelerator.Keys)
             {
-                log.Warn(string.Format("{0} took too long, dropping.", IPAddress.Parse(((IPEndPoint)h.RemoteEndPoint).Address.ToString())));
-                Console.WriteLine("{0} took too long, dropping.", IPAddress.Parse(((IPEndPoint)h.RemoteEndPoint).Address.ToString()));
-                h.Close();
-            }
-            catch
-            {
-                //the socket is probably gone, thats ok just move on
+                AcceleratorStatus accelerator = AcceleratorStatuses.Accelerator[acceleratorName];
+                foreach (string revitServer in accelerator.Status.Keys)
+                {
+                    accelerator.Status[revitServer] = CheckServerAtAccelerator(acceleratorName, revitServer);
+                }
             }
         }
 
 
-
+        /// <summary>
+        /// Here we will reach out to the accelerator at <paramref name="acceleratorName"/> and ask it for the status of the <paramref name="revitServer"/>
+        /// </summary>
+        /// <param name="acceleratorName"></param>
+        /// <param name="revitServer"></param>
+        /// <returns>The status of the accelerator as returned from the web service call</returns>
+        private static bool CheckServerAtAccelerator(string acceleratorName, string revitServer)
+        {
+            return false;
+        }
     }
 }
